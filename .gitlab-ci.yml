@@ -1,0 +1,213 @@
+stages:
+  - build
+  - test
+  - scan
+  - sbom
+  - deploy
+  - verify
+  - dast
+
+include:
+- template: Security/SAST.gitlab-ci.yml
+- template: Security/Secret-Detection.gitlab-ci.yml
+
+build_docker_image:
+  stage: build
+  variables:
+    REGISTRY: "cr.yandex" #leave it if your registry is yandex
+    YC_REGISTRY_ID: "crpccovdd2h78kkcuhgk" #set your registry ID
+    DOCKER_CUSTOM_SUBFOLDER: "app" #if your folder with docker files has some custom path
+    RUNNER_GENERATE_ARTIFACTS_METADATA: "true"
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  script:
+    - mkdir -p /kaniko/.docker
+    
+    #install jq
+    - wget -O jq https://github.com/stedolan/jq/releases/download/jq-1.5/jq-linux64 && chmod +x ./jq && cp jq /kaniko
+    
+    #get sa token from metadata
+    - wget --header Metadata-Flavor:Google 169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token && cp token /kaniko
+    - echo "{\"auths\":{\"cr.yandex\":{\"auth\":\"$(printf "%s:%s" "iam" "$(cat /kaniko/token | ./jq -r '.access_token')" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+    - >-
+      /kaniko/executor
+      --context "${CI_PROJECT_DIR}"/"${DOCKER_CUSTOM_SUBFOLDER}"
+      --dockerfile "${CI_PROJECT_DIR}/"${DOCKER_CUSTOM_SUBFOLDER}"/Dockerfile"
+      --destination "${REGISTRY}/${YC_REGISTRY_ID}/${CI_COMMIT_REF_SLUG}:${CI_COMMIT_SHA}" 
+
+sast:
+  stage: test
+  variables:
+    SCAN_KUBERNETES_MANIFESTS: "true" #enable kubesec for manifests and charts
+  artifacts:
+    paths:
+      - gl-sast-report.json
+
+container_scanning_yc:
+  image: 
+    name: pindar/jq
+    entrypoint: [""]
+  stage: scan
+  artifacts:
+    when: always
+    paths:
+      - gl-container-scanning-report-yc.json
+  variables:
+    REGISTRY: "cr.yandex" #leave it if your registry is yandex
+    YC_REGISTRY_ID: "crpccovdd2h78kkcuhgk" #set your registry ID
+    RUNNER_GENERATE_ARTIFACTS_METADATA: "true"
+  script:
+    - export CI_COMMIT_SHA=${CI_COMMIT_SHA}
+    
+    #install yc cli
+    - curl https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -a && cp /root/yandex-cloud/bin/yc /usr/bin/
+    
+    #start scan
+    - echo "Scanning image $IMAGE_NAME ${REGISTRY}/${YC_REGISTRY_ID}/${CI_COMMIT_REF_SLUG}:${CI_COMMIT_SHA}..."
+    - export IMAGE_ID=$(yc container image list --registry-id $YC_REGISTRY_ID --format=json | jq -r --arg CI_COMMIT_SHA $CI_COMMIT_SHA '.[] | select(.tags[0]==$CI_COMMIT_SHA) | .id ')
+    
+    #report
+    - export SCAN_RESULT=$(yc container image scan $IMAGE_ID --format=json)
+    - export CRIT_VULN=$(echo $SCAN_RESULT | jq -r '.vulnerabilities.critical // 0')
+    - export HIGH_VULN=$(echo $SCAN_RESULT | jq -r '.vulnerabilities.high // 0')
+    - export SCAN_ID=$(echo $SCAN_RESULT | jq -r '.id')
+    - echo "Scan results:"
+    - yc container image list-vulnerabilities --scan-result-id="${SCAN_ID}" --format json | jq -r '.[] | select(.severity=="CRITICAL", .severity=="HIGH")'
+    - yc container image list-vulnerabilities --scan-result-id="${SCAN_ID}" --format json | jq -r '.[] | select(.severity=="CRITICAL", .severity=="HIGH")' > gl-container-scanning-report-yc.json
+
+    # Check result - security gate
+  #  - (( SUM = $CRIT_VULN + $HIGH_VULN  )) && (( RES = (SUM >= 1) )) && echo $RES && echo "image has $CRIT_VULN critical vulns and $HIGH_VULN high vulns" && exit 1 || echo "image has no high or crit vulns" exit 0
+
+signing_and_sbom_generation:
+  stage: sbom
+  image:
+    name: ubuntu
+  variables:
+    REGISTRY: "cr.yandex" #leave it if your registry is yandex
+    YC_REGISTRY_ID: "crpccovdd2h78kkcuhgk" #set your registry ID
+    FOLDER_ID: "b1gd3iso99uv9q2c77ef" #set your folder ID
+    SIGNATURE_NAME: "sign" #set name for your signature
+  script:
+    - export CI_COMMIT_SHA=${CI_COMMIT_SHA}
+    - apt update && apt install curl -y
+    - export PATH=$PATH:/usr/bin/bash:~/bin
+    
+    #install syft for sbom generation
+    - curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b ~/bin
+    
+    #install jq
+    - apt-get install jq -y
+    
+    #get sa token from metadata
+    - curl -H Metadata-Flavor:Google 169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token > token
+    
+    #install docker
+    - apt install apt-transport-https ca-certificates curl software-properties-common -y
+    - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+    - add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu focal stable"
+    - apt-cache policy docker-ce
+    - apt install docker-ce -y 
+    - docker login --username iam --password $(cat token | jq -r '.access_token') cr.yandex
+
+    #generate sbom with syft
+    - syft $REGISTRY/$YC_REGISTRY_ID/${CI_COMMIT_REF_SLUG}:${CI_COMMIT_SHA} -o spdx-json > sbom-${CI_COMMIT_REF_SLUG}:${CI_COMMIT_SHA}.json
+
+    #install cosign from yandex fork
+    - curl https://storage.yandexcloud.net/cosign/linux-amd64/cosign --output cosign
+    - chmod 755 cosign 
+    - cp cosign /usr/local/bin/cosign
+
+    #preparing cosign
+    - export YC_IAM_TOKEN=$(cat token | jq -r '.access_token')
+    - cosign generate-key-pair --kms yckms:///folder/$FOLDER_ID/keyname/$SIGNATURE_NAME-${CI_COMMIT_SHA}
+    - curl https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -a && cp /root/yandex-cloud/bin/yc /usr/bin/
+    - export KMS_ID=$(yc kms asymmetric-signature-key get --name $SIGNATURE_NAME-${CI_COMMIT_SHA} --format json | jq -r '.id')
+
+    #sign image in CR
+    - docker login --username iam --password $YC_IAM_TOKEN cr.yandex
+    - cosign sign --key yckms:///$KMS_ID cr.yandex/$YC_REGISTRY_ID/${CI_COMMIT_REF_SLUG}:${CI_COMMIT_SHA} --tlog-upload=false
+
+    #sign sbom 
+    - cosign sign-blob --key yckms:///$KMS_ID --tlog-upload=false sbom-${CI_COMMIT_REF_SLUG}:${CI_COMMIT_SHA}.json -y
+    
+    #pull artifacts to object storage
+    # - apt install unzip -y
+    # - curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+    # - unzip awscliv2.zip
+    # - sh ./aws/install
+    # - aws --endpoint-url=https://storage.yandexcloud.net/ s3 cp sbom-${CI_COMMIT_REF_SLUG}:${CI_COMMIT_SHA}.json s3://artifacts-from-ci/sbom-${CI_COMMIT_REF_SLUG}:${CI_COMMIT_SHA}.json #set your name of bucket here
+
+  artifacts: 
+    paths: 
+      - sbom-${CI_COMMIT_REF_SLUG}:${CI_COMMIT_SHA}.json
+
+#Deploy image to test k8s
+deploy:
+  stage: deploy
+  variables:
+    CI_REGISTRY: "cr.yandex" #leave it if your registry is yandex
+    YC_REGISTRY_ID: "crpccovdd2h78kkcuhgk" #set your registry ID
+  image:
+      name: bitnami/kubectl:latest
+      entrypoint: [""]
+  script:
+  #prepare gitlab agent before this action https://cloud.yandex.ru/docs/managed-kubernetes/operations/applications/gitlab-agent in the project "k8s-config" 
+    - kubectl config use-context my-group/k8s-config:my-agent2 
+    - sed -ie "s/image_name/$CI_REGISTRY\\/$YC_REGISTRY_ID\\/$CI_COMMIT_REF_SLUG:$CI_COMMIT_SHA/g" k8s-manifest.yaml
+    - kubectl apply -f k8s-manifest.yaml
+
+#Verify signatures
+verify_signature:
+  stage: verify
+  image:
+    name: ubuntu
+  variables:
+    YC_REGISTRY_ID: "crpccovdd2h78kkcuhgk" #set your registry ID
+    FOLDER_ID: "b1gd3iso99uv9q2c77ef" #set your folder ID
+    SIGNATURE_NAME: "sign" #set name for your signature
+  script:
+    - export CI_COMMIT_SHA=${CI_COMMIT_SHA}
+    - apt update && apt install curl -y
+  #install jq
+    - apt-get install jq -y
+  
+  #install yc cli
+    - curl https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -a && cp /root/yandex-cloud/bin/yc /usr/bin/
+
+  #install cosign from yandex fork https://cloud.yandex.ru/docs/container-registry/tutorials/sign-with-cosign#cosign
+    - curl https://storage.yandexcloud.net/cosign/linux-amd64/cosign --output cosign
+    - chmod 755 cosign 
+    - cp cosign /usr/local/bin/cosign
+    
+    #get sa token from metadata
+    - curl -H Metadata-Flavor:Google 169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token > token
+    - export YC_IAM_TOKEN=$(cat token | jq -r '.access_token')
+    
+    - export KMS_ID=$(yc kms asymmetric-signature-key get --name $SIGNATURE_NAME-${CI_COMMIT_SHA} --format json | jq -r '.id')  
+
+    #install docker
+    - apt install apt-transport-https ca-certificates curl software-properties-common -y
+    - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+    - add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu focal stable"
+    - apt-cache policy docker-ce
+    - apt install docker-ce -y 
+    - docker login --username iam --password $YC_IAM_TOKEN cr.yandex
+    
+    #verify image 
+    - cosign verify --key yckms:///$KMS_ID cr.yandex/$YC_REGISTRY_ID/${CI_COMMIT_REF_SLUG}:${CI_COMMIT_SHA} --insecure-ignore-tlog 
+
+#DAST scan
+dast-free:
+  stage: dast
+  image: 
+    name: owasp/zap2docker-weekly
+    entrypoint: [""]
+  variables:
+    DAST_HOSTNAME: "158.160.131.167" #change to your domain name of app in staging
+  script:
+    - sed -ie "s/url_name/$DAST_HOSTNAME/g" dast-config/log4shell.yaml
+    - cp dast-config/log4shell.conf /zap/ 
+    - cp dast-config/log4shell.yaml /zap/
+    - zap.sh -cmd -configfile /zap/log4shell.conf -autorun /zap/log4shell.yaml -addonupdate -addoninstall ascanrulesAlpha
+    - cat /home/zap/owasp.json

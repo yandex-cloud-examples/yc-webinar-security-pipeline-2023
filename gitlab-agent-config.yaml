@@ -1,0 +1,7 @@
+gitops:
+  manifest_projects:
+  - id: "6" #id of group, where k8s-config and app progects
+    default_namespace: default
+ci_access:
+  groups:
+    - id: my-group #name of group, where k8s-config and app progects
