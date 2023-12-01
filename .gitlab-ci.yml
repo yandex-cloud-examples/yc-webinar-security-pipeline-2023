@@ -131,12 +131,11 @@ signing_and_sbom_generation:
     #sign sbom 
     - cosign sign-blob --key yckms:///$KMS_ID --tlog-upload=false sbom-${CI_COMMIT_REF_SLUG}:${CI_COMMIT_SHA}.json -y
     
-    #pull artifacts to object storage
-    # - apt install unzip -y
-    # - curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-    # - unzip awscliv2.zip
-    # - sh ./aws/install
-    # - aws --endpoint-url=https://storage.yandexcloud.net/ s3 cp sbom-${CI_COMMIT_REF_SLUG}:${CI_COMMIT_SHA}.json s3://artifacts-from-ci/sbom-${CI_COMMIT_REF_SLUG}:${CI_COMMIT_SHA}.json #set your name of bucket here
+    #pull artifacts to object storage - set your name of bucket here
+    - >-
+      curl -s 
+      -H "X-YaCloud-SubjectToken: $YC_IAM_TOKEN" -X PUT "https://storage.yandexcloud.net/artifacts-from-ci/sbom-${CI_COMMIT_REF_SLUG}:${CI_COMMIT_SHA}.json" 
+      -d sbom-${CI_COMMIT_REF_SLUG}:${CI_COMMIT_SHA}.json 
 
   artifacts: 
     paths: 
